@@ -36,6 +36,7 @@ class TestClass(object):
         self2.var_inst = first_param
         self2.second = second_param
         self2.first = first_param
+        self2.first.var_on_argument = 5
         a = 3
 
     def var_func(self):
@@ -216,6 +217,32 @@ class Dude(classgetter()):
         self.s
 
 # -----------------
+# multiple inheritance # 1071
+# -----------------
+
+class FactorMixin(object):
+    FACTOR_1 = 0.1
+
+class Calc(object):
+    def sum(self, a, b):
+        self.xxx = 3
+        return a + b
+
+class BetterCalc(Calc, FactorMixin):
+    def multiply_factor(self, a):
+        return a * self.FACTOR_1
+
+calc = BetterCalc()
+#? ['sum']
+calc.sum
+#? ['multiply_factor']
+calc.multip
+#? ['FACTOR_1']
+calc.FACTOR_1
+#? ['xxx']
+calc.xxx
+
+# -----------------
 # __call__
 # -----------------
 
@@ -391,6 +418,9 @@ class PrivateVar():
     def __private_func(self):
         return 1
 
+    #? int()
+    __private_func()
+
     def wrap_private(self):
         return self.__private_func()
 #? []
@@ -399,6 +429,8 @@ PrivateVar().__var
 PrivateVar().__var
 #? []
 PrivateVar().__private_func
+#? []
+PrivateVar.__private_func
 #? int()
 PrivateVar().wrap_private()
 
@@ -422,17 +454,18 @@ class Super(object):
     a = 3
     def return_sup(self):
         return 1
+SuperCopy = Super
 
 class TestSuper(Super):
     #?
     super()
     def test(self):
-        #? Super()
+        #? SuperCopy()
         super()
         #? ['a']
         super().a
         if 1:
-            #? Super()
+            #? SuperCopy()
             super()
         def a():
             #?
@@ -445,6 +478,17 @@ class TestSuper(Super):
 #? int()
 TestSuper().return_sup()
 
+
+Super = 3
+
+class Foo():
+    def foo(self):
+        return 1
+# Somehow overwriting the same name caused problems (#1044)
+class Foo(Foo):
+    def foo(self):
+        #? int()
+        super().foo()
 
 # -----------------
 # if flow at class level

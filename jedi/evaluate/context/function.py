@@ -17,17 +17,20 @@ from jedi.evaluate.base_context import ContextualizedNode, NO_CONTEXTS, \
 from jedi.evaluate.lazy_context import LazyKnownContexts, LazyKnownContext, \
     LazyTreeContext
 from jedi.evaluate.context import iterable
+from jedi.evaluate.context import asynchronous
 from jedi import parser_utils
 from jedi.evaluate.parser_cache import get_yield_exprs
 
 
 class LambdaName(AbstractNameDefinition):
     string_name = '<lambda>'
+    api_type = u'function'
 
     def __init__(self, lambda_context):
         self._lambda_context = lambda_context
         self.parent_context = lambda_context.parent_context
 
+    @property
     def start_pos(self):
         return self._lambda_context.tree_node.start_pos
 
@@ -35,16 +38,8 @@ class LambdaName(AbstractNameDefinition):
         return ContextSet(self._lambda_context)
 
 
-class FunctionContext(use_metaclass(CachedMetaClass, TreeContext)):
-    """
-    Needed because of decorators. Decorators are evaluated here.
-    """
-    api_type = 'function'
-
-    def __init__(self, evaluator, parent_context, funcdef):
-        """ This should not be called directly """
-        super(FunctionContext, self).__init__(evaluator, parent_context)
-        self.tree_node = funcdef
+class AbstractFunction(TreeContext):
+    api_type = u'function'
 
     def get_filters(self, search_global, until_position=None, origin_scope=None):
         if search_global:
@@ -59,34 +54,10 @@ class FunctionContext(use_metaclass(CachedMetaClass, TreeContext)):
             for filter in scope.get_filters(search_global=False, origin_scope=origin_scope):
                 yield filter
 
-    def infer_function_execution(self, function_execution):
-        """
-        Created to be used by inheritance.
-        """
-        yield_exprs = get_yield_exprs(self.evaluator, self.tree_node)
-        if yield_exprs:
-            return ContextSet(iterable.Generator(self.evaluator, function_execution))
-        else:
-            return function_execution.get_return_values()
-
-    def get_function_execution(self, arguments=None):
-        if arguments is None:
-            arguments = AnonymousArguments()
-
-        return FunctionExecutionContext(self.evaluator, self.parent_context, self, arguments)
-
-    def py__call__(self, arguments):
-        function_execution = self.get_function_execution(arguments)
-        return self.infer_function_execution(function_execution)
-
-    def py__class__(self):
-        # This differentiation is only necessary for Python2. Python3 does not
-        # use a different method class.
-        if isinstance(parser_utils.get_parent_scope(self.tree_node), tree.Class):
-            name = 'METHOD_CLASS'
-        else:
-            name = 'FUNCTION_CLASS'
-        return compiled.get_special_object(self.evaluator, name)
+    def get_param_names(self):
+        function_execution = self.get_function_execution()
+        return [ParamName(function_execution, param.name)
+                for param in self.tree_node.get_params()]
 
     @property
     def name(self):
@@ -94,10 +65,60 @@ class FunctionContext(use_metaclass(CachedMetaClass, TreeContext)):
             return LambdaName(self)
         return ContextName(self, self.tree_node.name)
 
-    def get_param_names(self):
-        function_execution = self.get_function_execution()
-        return [ParamName(function_execution, param.name)
-                for param in self.tree_node.get_params()]
+    def get_function_execution(self, arguments=None):
+        raise NotImplementedError
+
+    def py__call__(self, arguments):
+        function_execution = self.get_function_execution(arguments)
+        return self.infer_function_execution(function_execution)
+
+    def infer_function_execution(self, function_execution):
+        """
+        Created to be used by inheritance.
+        """
+        is_coroutine = self.tree_node.parent.type == 'async_stmt'
+        is_generator = bool(get_yield_exprs(self.evaluator, self.tree_node))
+
+        if is_coroutine:
+            if is_generator:
+                if self.evaluator.environment.version_info < (3, 6):
+                    return NO_CONTEXTS
+                return ContextSet(asynchronous.AsyncGenerator(self.evaluator, function_execution))
+            else:
+                if self.evaluator.environment.version_info < (3, 5):
+                    return NO_CONTEXTS
+                return ContextSet(asynchronous.Coroutine(self.evaluator, function_execution))
+        else:
+            if is_generator:
+                return ContextSet(iterable.Generator(self.evaluator, function_execution))
+            else:
+                return function_execution.get_return_values()
+
+    def py__name__(self):
+        return self.name.string_name
+
+
+class FunctionContext(use_metaclass(CachedMetaClass, AbstractFunction)):
+    """
+    Needed because of decorators. Decorators are evaluated here.
+    """
+    @classmethod
+    def from_context(cls, context, tree_node):
+        from jedi.evaluate.context import AbstractInstanceContext
+
+        while context.is_class() or isinstance(context, AbstractInstanceContext):
+            context = context.parent_context
+
+        return cls(context.evaluator, parent_context=context, tree_node=tree_node)
+
+    def get_function_execution(self, arguments=None):
+        if arguments is None:
+            arguments = AnonymousArguments()
+
+        return FunctionExecutionContext(self.evaluator, self.parent_context, self, arguments)
+
+    def py__class__(self):
+        return compiled.get_special_object(self.evaluator, u'FUNCTION_CLASS')
 
 
 class FunctionExecutionContext(TreeContext):
@@ -112,9 +133,12 @@ class FunctionExecutionContext(TreeContext):
     function_execution_filter = FunctionExecutionFilter
 
     def __init__(self, evaluator, parent_context, function_context, var_args):
-        super(FunctionExecutionContext, self).__init__(evaluator, parent_context)
+        super(FunctionExecutionContext, self).__init__(
+            evaluator,
+            parent_context,
+            function_context.tree_node,
+        )
         self.function_context = function_context
-        self.tree_node = function_context.tree_node
         self.var_args = var_args
 
     @evaluator_method_cache(default=NO_CONTEXTS)
@@ -122,7 +146,7 @@ class FunctionExecutionContext(TreeContext):
     def get_return_values(self, check_yields=False):
         funcdef = self.tree_node
         if funcdef.type == 'lambdef':
-            return self.evaluator.eval_element(self, funcdef.children[-1])
+            return self.eval_node(funcdef.children[-1])
 
         if check_yields:
             context_set = NO_CONTEXTS
@@ -140,13 +164,14 @@ class FunctionExecutionContext(TreeContext):
                 if check_yields:
                     context_set |= ContextSet.from_sets(
                         lazy_context.infer()
-                        for lazy_context in self._eval_yield(r)
+                        for lazy_context in self._get_yield_lazy_context(r)
                     )
                 else:
                     try:
                         children = r.children
                     except AttributeError:
-                        context_set |= ContextSet(compiled.create(self.evaluator, None))
+                        ctx = compiled.builtin_from_name(self.evaluator, u'None')
+                        context_set |= ContextSet(ctx)
                     else:
                         context_set |= self.eval_node(children[1])
             if check is flow_analysis.REACHABLE:
@@ -154,10 +179,11 @@ class FunctionExecutionContext(TreeContext):
                 break
         return context_set
 
-    def _eval_yield(self, yield_expr):
+    def _get_yield_lazy_context(self, yield_expr):
         if yield_expr.type == 'keyword':
             # `yield` just yields None.
-            yield LazyKnownContext(compiled.create(self.evaluator, None))
+            ctx = compiled.builtin_from_name(self.evaluator, u'None')
+            yield LazyKnownContext(ctx)
             return
 
         node = yield_expr.children[1]
@@ -169,7 +195,8 @@ class FunctionExecutionContext(TreeContext):
             yield LazyTreeContext(self, node)
 
     @recursion.execution_recursion_decorator(default=iter([]))
-    def get_yield_values(self):
+    def get_yield_lazy_contexts(self, is_async=False):
+        # TODO: if is_async, wrap yield statements in Awaitable/async_generator_asend
         for_parents = [(y, tree.search_ancestor(y, 'for_stmt', 'funcdef',
                                                 'while_stmt', 'if_stmt'))
                        for y in get_yield_exprs(self.evaluator, self.tree_node)]
@@ -202,7 +229,7 @@ class FunctionExecutionContext(TreeContext):
             if for_stmt is None:
                 # No for_stmt, just normal yields.
                 for yield_ in yields:
-                    for result in self._eval_yield(yield_):
+                    for result in self._get_yield_lazy_context(yield_):
                         yield result
             else:
                 input_node = for_stmt.get_testlist()
@@ -213,7 +240,7 @@ class FunctionExecutionContext(TreeContext):
                     dct = {str(for_stmt.children[1].value): lazy_context.infer()}
                     with helpers.predefine_names(self, for_stmt, dct):
                         for yield_in_same_for_stmt in yields:
-                            for result in self._eval_yield(yield_in_same_for_stmt):
+                            for result in self._get_yield_lazy_context(yield_in_same_for_stmt):
                                 yield result
 
     def get_filters(self, search_global, until_position=None, origin_scope=None):
@@ -222,5 +249,5 @@ class FunctionExecutionContext(TreeContext):
                                              origin_scope=origin_scope)
 
     @evaluator_method_cache()
-    def get_params(self):
-        return self.var_args.get_params(self)
+    def get_executed_params(self):
+        return self.var_args.get_executed_params(self)

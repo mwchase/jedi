@@ -17,7 +17,8 @@ said, the typical entry point for static analysis is calling
 ``eval_expr_stmt``. There's separate logic for autocompletion in the API, the
 evaluator is all about evaluating an expression.
 
-TODO this paragraph is not what jedi does anymore.
+TODO this paragraph is not what jedi does anymore, it's similar, but not the
+same.
 
 Now you need to understand what follows after ``eval_expr_stmt``. Let's
 make an example::
@@ -62,10 +63,9 @@ only *evaluates* what needs to be *evaluated*. All the statements and modules
 that are not used are just being ignored.
 """
 
-import sys
-
 from parso.python import tree
 import parso
+from parso import python_bytes_to_unicode
 
 from jedi import debug
 from jedi import parser_utils
@@ -86,32 +86,49 @@ from jedi.evaluate.syntax_tree import eval_trailer, eval_expr_stmt, \
 
 
 class Evaluator(object):
-    def __init__(self, grammar, project):
-        self.grammar = grammar
+    def __init__(self, project, environment=None, script_path=None):
+        if environment is None:
+            environment = project.get_environment()
+        self.environment = environment
+        self.script_path = script_path
+        self.compiled_subprocess = environment.get_evaluator_subprocess(self)
+        self.grammar = environment.get_grammar()
+
         self.latest_grammar = parso.load_grammar(version='3.6')
         self.memoize_cache = {}  # for memoize decorators
-        # To memorize modules -> equals `sys.modules`.
-        self.modules = {}  # like `sys.modules`.
+        self.module_cache = imports.ModuleCache()  # does the job of `sys.modules`.
         self.compiled_cache = {}  # see `evaluate.compiled.create()`
         self.inferred_element_counts = {}
         self.mixed_cache = {}  # see `evaluate.compiled.mixed._create()`
         self.analysis = []
         self.dynamic_params_depth = 0
         self.is_analysis = False
-        self.python_version = sys.version_info[:2]
         self.project = project
-        project.add_evaluator(self)
+        self.access_cache = {}
+        # This setting is only temporary to limit the work we have to do with
+        # tensorflow and others.
+        self.infer_enabled = True
 
         self.reset_recursion_limitations()
+        self.allow_different_encoding = True
 
-        # Constants
-        self.BUILTINS = compiled.get_special_object(self, 'BUILTINS')
+    @property
+    @evaluator_function_cache()
+    def builtins_module(self):
+        return compiled.get_special_object(self, u'BUILTINS')
 
     def reset_recursion_limitations(self):
         self.recursion_detector = recursion.RecursionDetector()
         self.execution_recursion_detector = recursion.ExecutionRecursionDetector(self)
 
+    def get_sys_path(self):
+        """Convenience function"""
+        return self.project._get_sys_path(self, environment=self.environment)
+
     def eval_element(self, context, element):
+        if not self.infer_enabled:
+            return NO_CONTEXTS
+
         if isinstance(context, CompForContext):
             return eval_node(context, element)
 
@@ -124,7 +141,11 @@ class Evaluator(object):
                 if_stmt = None
                 break
         predefined_if_name_dict = context.predefined_names.get(if_stmt)
-        if predefined_if_name_dict is None and if_stmt and if_stmt.type == 'if_stmt':
+        # TODO there's a lot of issues with this one. We actually should do
+        # this in a different way. Caching should only be active in certain
+        # cases and this all sucks.
+        if predefined_if_name_dict is None and if_stmt \
+                and if_stmt.type == 'if_stmt' and self.is_analysis:
             if_stmt_test = if_stmt.children[1]
             name_dicts = [{}]
             # If we already did a check, we don't want to do it again -> If
@@ -201,7 +222,7 @@ class Evaluator(object):
             if type_ == 'classdef':
                 return [ClassContext(self, context, name.parent)]
             elif type_ == 'funcdef':
-                return [FunctionContext(self, context, name.parent)]
+                return [FunctionContext.from_context(context, name.parent)]
 
             if type_ == 'expr_stmt':
                 is_simple_name = name.parent.type not in ('power', 'trailer')
@@ -319,16 +340,15 @@ class Evaluator(object):
             parent_context = from_scope_node(parent_scope, child_is_funcdef=is_funcdef)
 
             if is_funcdef:
+                func = FunctionContext.from_context(
+                    parent_context,
+                    scope_node
+                )
                 if isinstance(parent_context, AnonymousInstance):
                     func = BoundMethod(
-                        self, parent_context, parent_context.class_context,
-                        parent_context.parent_context, scope_node
-                    )
-                else:
-                    func = FunctionContext(
-                        self,
-                        parent_context,
-                        scope_node
+                        instance=parent_context,
+                        klass=parent_context.class_context,
+                        function=func
                     )
                 if is_nested and not node_is_object:
                     return func.get_function_execution()
@@ -357,3 +377,15 @@ class Evaluator(object):
                 node = node.parent
             scope_node = parent_scope(node)
         return from_scope_node(scope_node, is_nested=True, node_is_object=node_is_object)
+
+    def parse_and_get_code(self, code=None, path=None, encoding='utf-8', **kwargs):
+        if self.allow_different_encoding:
+            if code is None:
+                with open(path, 'rb') as f:
+                    code = f.read()
+            code = python_bytes_to_unicode(code, encoding=encoding, errors='replace')
+
+        return self.grammar.parse(code=code, path=path, **kwargs), code
+
+    def parse(self, *args, **kwargs):
+        return self.parse_and_get_code(*args, **kwargs)[0]
